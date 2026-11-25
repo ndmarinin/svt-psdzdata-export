@@ -697,12 +697,12 @@ class App(_BaseTk):
             self.staging_dir = new_staging_dir()
             self.archive_reader = ArchiveReader(psdz)
             self.after(0, lambda: self.log_line(f"{self.tr('log_archive')}: {psdz}"))
-            index = build_archive_index(
-                self.archive_reader,
-                progress=lambda n, kind: self.after(
-                    0, lambda n=n, kind=kind: self.status_var.set(self.tr("status_index", kind=kind, count=n))
-                ),
-            )
+
+            def archive_progress(phase, done, total):
+                key = "status_index_read" if phase == "read" else "status_index_zip"
+                self.after(0, lambda: self.status_var.set(self.tr(key, done=done, total=total)))
+
+            index = build_archive_index(self.archive_reader, progress=archive_progress)
         else:
             self.archive_path = None
             self._cleanup_staging()

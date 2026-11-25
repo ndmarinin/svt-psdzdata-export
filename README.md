@@ -62,7 +62,7 @@ flowchart LR
 - In Ist → Soll mode, compares parts by ECU (address + base variant) and `processClass` + ID: **update**, **new**, or **unchanged**
 - In TAL mode, reads every `talLine` and its actions; actions without files (`idBackup`, `fscDeploy`, …) are listed for reference
 - Indexes `psdzdata/swe/{btld,swfl,swfk,cafd,...}` and matches names such as `cafd_00004146.caf.003_037_007`
-- PSdZData as a `.zip` / `.7z` archive: the SWE file list is read without unpacking (`.7z` needs `py7zr`), and only the matching files are extracted to a temp folder before the export. The zip central directory is parsed streaming, so a full pack with millions of files works with ~100 MB of RAM instead of several GB — fine for archives on a network share
+- PSdZData as a `.zip` / `.7z` archive: the SWE file list is read without unpacking (`.7z` needs `py7zr`), and only the matching files are extracted to a temp folder before the export. The zip central directory is pulled with one sequential read and parsed locally (~100 MB of RAM even for a full pack), and the result is cached in the system temp dir — the second run with the same archive does not touch the network at all
 - Marks rows as **found**, **missing**, **other version available**, **replaced**, or **incomplete bin/xml**
 - Exports only checked blocks and types and writes `svt_export_manifest.txt`
 

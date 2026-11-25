@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import io
+import json
 import os
 import re
 import shutil
@@ -396,6 +397,10 @@ def _looks_like_swe(path: Path) -> bool:
 
 # ------------------------------------------------------------------ archives
 ARCHIVE_SUFFIXES = frozenset({".zip", ".7z"})
+# A SWE file name always ends in ".<ext>.ddd_ddd_ddd"; a cheap bytes check
+# rejects most central-directory entries before any decoding happens.
+_SWE_SUFFIX_RE = re.compile(rb"\.\d{3}_\d{3}_\d{3}$")
+_CACHE_VERSION = 1
 
 
 class ArchiveError(RuntimeError):
@@ -409,23 +414,28 @@ def is_archive(path: str | Path) -> bool:
 class ArchiveReader:
     """Random access to the members of a PSdZData .zip or .7z archive.
 
-    Full PSdZData packs hold millions of files. zipfile loads the whole
-    central directory (multi-GB) plus one object per entry into memory, so
-    for .zip the directory is parsed streaming instead and only SWE files
-    are kept. Keep one reader open for the whole session: reopening would
-    re-read the central directory over the network.
+    Full PSdZData packs hold millions of files, so for .zip the central
+    directory is downloaded with one sequential read and parsed streaming —
+    only SWE-named entries are kept in memory. The directory is read lazily
+    (on first use) so a cached session can skip it entirely. Keep one reader
+    open for the whole session: reopening would re-read the directory.
     """
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
         self._7z = None
         self._fh = None
+        self._names: list[str] = []
         # name -> (local_offset, comp_size, uncomp_size, method, crc, flags)
         self._swe: dict[str, tuple[int, int, int, int, int, int]] = {}
+        self._ready = False
+        self._cd_offset = 0
+        self._cd_size = 0
+        self._total_entries = 0
         if self.path.suffix.lower() == ".zip":
             try:
                 self._fh = open(self.path, "rb", buffering=4 * 1024 * 1024)
-                self._read_zip_directory()
+                self._locate_zip_directory()
             except ArchiveError:
                 self.close()
                 raise
@@ -443,9 +453,11 @@ class ArchiveReader:
                     self._names = [entry.filename for entry in archive.list() if not entry.is_directory]
             except Exception as exc:
                 raise ArchiveError(f"{self.path.name}: {exc}") from exc
+            self._ready = True
 
     # ---- zip ---------------------------------------------------------
-    def _read_zip_directory(self) -> None:
+    def _locate_zip_directory(self) -> None:
+        """Find the central directory; cheap reads only, parsing is lazy."""
         fh = self._fh
         file_size = fh.seek(0, os.SEEK_END)
         scan = min(file_size, 65536 + 22)
@@ -473,9 +485,54 @@ class ArchiveReader:
                 raise ArchiveError(f"{self.path.name}: multi-disk zip archives are not supported")
             if total_entries in (0xFFFF, 0xFFFFFFFF) or cd_size == 0xFFFFFFFF or cd_offset == 0xFFFFFFFF:
                 total_entries = z64_total
+        self._cd_offset = cd_offset
+        self._cd_size = cd_size
+        self._total_entries = total_entries
 
-        fh.seek(cd_offset)
-        remaining = cd_size
+    def _ensure_directory(self, progress=None) -> None:
+        """Read and parse the central directory once. progress(phase, done, total)."""
+        if self._ready:
+            return
+        try:
+            self._read_zip_directory(progress)
+            self._ready = True
+        except OSError as exc:
+            raise ArchiveError(f"{self.path.name}: {exc}") from exc
+
+    def _read_zip_directory(self, progress=None) -> None:
+        fh = self._fh
+        fh.seek(self._cd_offset)
+        remaining = self._cd_size
+        source = fh
+        tmp = None
+        if remaining > 64 * 1024 * 1024:
+            # The directory is multi-GB: pull it to the local disk with one
+            # sequential read, then parse locally — the network stays busy
+            # and is not slowed down by the parsing.
+            tmp = tempfile.TemporaryFile()
+            done = 0
+            while remaining:
+                chunk = fh.read(min(8 * 1024 * 1024, remaining))
+                if not chunk:
+                    tmp.close()
+                    raise ArchiveError(f"{self.path.name}: truncated zip central directory")
+                remaining -= len(chunk)
+                done += len(chunk)
+                tmp.write(chunk)
+                if progress:
+                    progress("read", done // (1024 * 1024), self._cd_size // (1024 * 1024))
+            tmp.seek(0)
+            source = tmp
+            remaining = self._cd_size
+        try:
+            self._parse_zip_directory(source, progress)
+        finally:
+            if tmp is not None:
+                tmp.close()
+
+    def _parse_zip_directory(self, source, progress=None) -> None:
+        fh = source
+        remaining = self._cd_size
         buf = bytearray()
         pos = 0
         parsed = 0
@@ -513,9 +570,19 @@ class ArchiveReader:
                     pos = 0
                 buf += chunk
                 continue
-            name = bytes(buf[pos + 46:pos + 46 + name_len]).decode(
-                "utf-8" if flags & 0x800 else "cp437"
-            ).replace("\\", "/")
+            name_raw = bytes(buf[pos + 46:pos + 46 + name_len])
+            # Quick reject: only names ending in ".<ext>.ddd_ddd_ddd" can be
+            # SWE files; most entries of a full pack are not.
+            if not _SWE_SUFFIX_RE.search(name_raw):
+                parsed += 1
+                pos += entry_len
+                if progress and parsed % 100000 == 0:
+                    progress("parse", parsed, self._total_entries)
+                continue
+            try:
+                name = name_raw.decode("utf-8" if flags & 0x800 else "cp437").replace("\\", "/")
+            except UnicodeDecodeError:
+                name = name_raw.decode("cp437").replace("\\", "/")
             if csize == 0xFFFFFFFF or usize == 0xFFFFFFFF or offset == 0xFFFFFFFF:
                 csize, usize, offset = self._zip64_extra(
                     bytes(buf[pos + 46 + name_len:pos + 46 + name_len + extra_len]),
@@ -523,10 +590,12 @@ class ArchiveReader:
                 )
             parsed += 1
             pos += entry_len
+            if progress and parsed % 100000 == 0:
+                progress("parse", parsed, self._total_entries)
             if not SWE_NAME_RE.match(name.rsplit("/", 1)[-1]):
                 continue
             self._swe[name] = (offset, csize, usize, method, crc, flags)
-        if parsed != total_entries:
+        if parsed != self._total_entries:
             raise ArchiveError(f"{self.path.name}: incomplete zip central directory")
 
     @staticmethod
@@ -601,6 +670,7 @@ class ArchiveReader:
     def iter_names(self):
         """Yield member names. For .zip only SWE-named files (see class doc)."""
         if self._fh is not None:
+            self._ensure_directory()
             yield from self._swe
             return
         yield from self._names
@@ -608,6 +678,7 @@ class ArchiveReader:
     def extract(self, member: str, dest: Path) -> None:
         dest.parent.mkdir(parents=True, exist_ok=True)
         if self._fh is not None:
+            self._ensure_directory()
             self._extract_zip(member, dest)
             return
         # 7z: py7zr extracts preserving the member's folders, so unpack into a
@@ -637,26 +708,77 @@ class ArchiveReader:
         self.close()
 
 
+def _archive_cache_file(archive_path: Path) -> Path | None:
+    """Cache file for a given archive, keyed by path + size + mtime."""
+    try:
+        stat = archive_path.stat()
+        key = f"{archive_path.resolve().as_posix()}|{stat.st_size}|{stat.st_mtime_ns}"
+        digest = hashlib.sha1(key.encode("utf-8", "surrogatepass")).hexdigest()
+        return Path(tempfile.gettempdir()) / "svt_export_cache" / f"{digest}.json"
+    except OSError:
+        return None
+
+
+def _load_entry_cache(archive_path: Path) -> list | None:
+    cache_file = _archive_cache_file(archive_path)
+    if cache_file is None or not cache_file.is_file():
+        return None
+    try:
+        data = json.loads(cache_file.read_text(encoding="utf-8"))
+        if data.get("v") == _CACHE_VERSION and isinstance(data.get("entries"), list):
+            return data["entries"]
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _save_entry_cache(archive_path: Path, entries: list) -> None:
+    cache_file = _archive_cache_file(archive_path)
+    if cache_file is None:
+        return
+    try:
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        tmp = cache_file.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"v": _CACHE_VERSION, "entries": entries}), encoding="utf-8")
+        os.replace(tmp, cache_file)
+    except OSError:
+        pass
+
+
 def build_archive_index(source: "str | Path | ArchiveReader", progress=None) -> SweIndex:
     """Index the SWE files inside a PSdZData archive without extracting it.
 
     The index maps part keys to in-archive member paths; they become real
     files under a staging folder after ensure_extracted() runs. Pass an
     already open ArchiveReader to avoid re-reading the archive directory.
+    progress(phase, done, total) reports the directory phases ("read" in MB,
+    "parse" in entries). A parsed archive is cached in the system temp dir,
+    so repeated runs skip the directory read entirely.
     """
     if isinstance(source, ArchiveReader):
         reader = source
         archive_path = reader.path
+        owns_reader = False
     else:
         archive_path = Path(source)
         if not archive_path.is_file():
             raise FileNotFoundError(archive_path)
         reader = ArchiveReader(archive_path)
-    candidates: dict[tuple[str, str, str], dict[str, int]] = defaultdict(dict)
-    versions: dict[tuple[str, str], set[str]] = defaultdict(set)
-    kind_counts: dict[str, int] = defaultdict(int)
-    counted = 0
+        owns_reader = True
     try:
+        if reader._fh is not None:  # zip: load the parsed directory or cache it
+            entries = _load_entry_cache(archive_path)
+            if entries is not None:
+                reader._swe = {name: tuple(rec) for name, *rec in entries}
+                reader._ready = True
+            else:
+                reader._ensure_directory(progress)
+                entries = [[name, *rec] for name, rec in reader._swe.items()]
+                _save_entry_cache(archive_path, entries)
+        candidates: dict[tuple[str, str, str], dict[str, int]] = defaultdict(dict)
+        versions: dict[tuple[str, str], set[str]] = defaultdict(set)
+        kind_counts: dict[str, int] = defaultdict(int)
+        counted = 0
         for member in reader.iter_names():
             parsed = SWE_NAME_RE.match(member.rsplit("/", 1)[-1])
             if not parsed:
@@ -671,10 +793,8 @@ def build_archive_index(source: "str | Path | ArchiveReader", progress=None) -> 
             versions[(kind, ident)].add(version)
             kind_counts[kind] += 1
             counted += 1
-            if progress and counted % 2500 == 0:
-                progress(counted, kind)
     finally:
-        if reader is not source:
+        if owns_reader:
             reader.close()
     files: dict[tuple[str, str, str], list[Path]] = {}
     for key, members in candidates.items():
