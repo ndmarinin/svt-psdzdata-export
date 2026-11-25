@@ -766,7 +766,7 @@ class App(_BaseTk):
             self.after(0, lambda: self._apply_search_results(doc, doc_ist, index, matches))
         except Exception as exc:
             error = traceback.format_exc()
-            self.after(0, lambda: self._search_failed(exc, error))
+            self.after(0, lambda exc=exc, error=error: self._search_failed(exc, error))
 
     def _apply_search_results(self, doc, doc_ist, index, matches) -> None:
         classes = sorted({part.process_class for _, part in doc.parts if part.process_class})
@@ -1288,7 +1288,7 @@ class App(_BaseTk):
             self.after(0, lambda: self._export_done(copied, skipped, errors, out))
         except Exception as exc:
             error = traceback.format_exc()
-            self.after(0, lambda: self._search_failed(exc, error))
+            self.after(0, lambda exc=exc, error=error: self._search_failed(exc, error))
 
     def _export_progress(self, pct: int, done: int, total: int, name: str) -> None:
         self.progress.configure(value=pct)
@@ -1519,7 +1519,7 @@ class App(_BaseTk):
             self.after(0, lambda: (self._render_batch(), self._export_done(totals[0], totals[1], all_errors, out)))
         except Exception as exc:
             error = traceback.format_exc()
-            self.after(0, lambda: self._search_failed(exc, error))
+            self.after(0, lambda exc=exc, error=error: self._search_failed(exc, error))
 
     # ---------------------------------------------------------------- config
     def _persist(self) -> None:
