@@ -2,7 +2,7 @@
 
 **Version 1.2.0** — Windows tool that reads a BMW **SVT** or **TAL** XML, finds the matching SWE files in **PSdZData**, and copies only what you need into a folder.
 
-Use it to build a small `psdzdata/swe` set for one car (CAFD / BTLD / SWFL / SWFK) instead of shipping the full dataset.
+Use it to build a small `psdzdata/swe` set for one car (CAFD / BTLD / SWFL / SWFK) instead of shipping the full dataset. PSdZData can be a folder **or a `.zip` / `.7z` archive** — the tool reads the file list inside the archive and extracts only the files your SVT/TAL actually needs.
 
 UI languages: **English, Deutsch, Українська, Русский**. First launch follows the Windows UI language. You can change it in the window; the choice is stored in `svt_export.json`.
 
@@ -62,6 +62,7 @@ flowchart LR
 - In Ist → Soll mode, compares parts by ECU (address + base variant) and `processClass` + ID: **update**, **new**, or **unchanged**
 - In TAL mode, reads every `talLine` and its actions; actions without files (`idBackup`, `fscDeploy`, …) are listed for reference
 - Indexes `psdzdata/swe/{btld,swfl,swfk,cafd,...}` and matches names such as `cafd_00004146.caf.003_037_007`
+- PSdZData as a `.zip` / `.7z` archive: the SWE file list is read without unpacking (`.7z` needs `py7zr`), and only the matching files are extracted to a temp folder before the export
 - Marks rows as **found**, **missing**, **other version available**, **replaced**, or **incomplete bin/xml**
 - Exports only checked blocks and types and writes `svt_export_manifest.txt`
 
@@ -88,7 +89,7 @@ py -3 app.py --lang en
 ```
 
 1. Pick a source at the top: **Single SVT**, **SVT-Ist → SVT-Soll**, **TAL** or **Batch**
-2. Set the PSdZData folder (Lite/Full root or `psdzdata` itself), the XML file(s) and the export folder — or drop them onto the window
+2. Set the PSdZData folder (Lite/Full root or `psdzdata` itself) **or a `.zip`/`.7z` archive** (button *Archive…* or drag & drop), the XML file(s) and the export folder
 3. Click **Find files** / **Compare and find** / **Read TAL and find** / **Process all**
 4. Check blocks: **All** / **None** / **Found only** / checkboxes on an ECU or a single part
 5. Right-click a part with another version available to pick a replacement
@@ -132,10 +133,12 @@ On a full PSdZData the placeholders become real `.bin` / `.caf` / `.xml` files. 
 
 ```bat
 py -3 app.py --svt "C:\path\svt.xml" --psdz "C:\PSdZData 4.60.11 Lite" --out "D:\export"
+py -3 app.py --svt "C:\path\svt.xml" --psdz "D:\PSdZData_4.60.zip" --out "D:\export"
 ```
 
 | Option | Meaning |
 |---|---|
+| `--psdz` | PSdZData folder or `.zip`/`.7z` archive (only the needed files are extracted) |
 | `--svt FILE` | SVT (with `--soll`: the current SVT-Ist) |
 | `--soll FILE` | target SVT-Soll; exports only what changes (`--all-parts` for everything) |
 | `--tal FILE` | TAL from E-Sys |

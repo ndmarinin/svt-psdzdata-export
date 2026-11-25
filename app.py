@@ -3,7 +3,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import sys
+import tempfile
 import threading
 import traceback
 import webbrowser
@@ -12,22 +14,28 @@ from tkinter import filedialog, messagebox, ttk
 import tkinter as tk
 
 from engine import (
+    ARCHIVE_SUFFIXES,
+    ArchiveError,
     CHANGE_NEW,
     CHANGE_SAME,
     CHANGE_UPDATE,
     HARDWARE_CLASSES,
     apply_override,
     batch_name,
+    build_archive_index,
     build_index,
     detect_xml_kind,
+    ensure_extracted,
     export_matches,
     full_report_csv,
+    is_archive,
     load_document,
     match_diff,
     match_svt,
     missing_matches,
     missing_report,
     nearest_version,
+    new_staging_dir,
     resolve_swe_root,
     summarize,
     zip_folder,
@@ -149,6 +157,8 @@ class App(_BaseTk):
         self.mega_links: list[str] = []
         self.mega_errors: list[str] = []
         self.batch_files = [item for item in cfg.get("batch", []) if isinstance(item, str)]
+        self.archive_path: Path | None = None
+        self.staging_dir: Path | None = None
 
         self._build()
         self._apply_language()
@@ -194,6 +204,8 @@ class App(_BaseTk):
         self.paths_frame = ttk.LabelFrame(root, text="", padding=8)
         self.paths_frame.pack(fill="x", pady=(8, 0))
         self.row_psdz = self._path_row(self.paths_frame, 0, self.psdz_var, self._browse_psdz)
+        self.btn_archive = ttk.Button(self.paths_frame, command=self._browse_psdz_archive)
+        self.btn_archive.grid(row=0, column=3, padx=(6, 0), pady=2)
         self.row_svt = self._path_row(self.paths_frame, 1, self.svt_var, lambda: self._browse_xml(self.svt_var))
         self.row_ist = self._path_row(self.paths_frame, 2, self.ist_var, lambda: self._browse_xml(self.ist_var))
         self.row_soll = self._path_row(self.paths_frame, 3, self.soll_var, lambda: self._browse_xml(self.soll_var))
@@ -416,6 +428,7 @@ class App(_BaseTk):
         self.row_out[0].configure(text=self.tr("path_out"))
         for row in (self.row_psdz, self.row_svt, self.row_ist, self.row_soll, self.row_tal, self.row_out):
             row[2].configure(text=self.tr("browse"))
+        self.btn_archive.configure(text=self.tr("browse_archive"))
         self.drop_hint.configure(text=self.tr("drop_hint") if HAS_DND else self.tr("drop_hint_exe"))
         self.lbl_lang.configure(text=self.tr("language"))
         self.types_frame.configure(text=self.tr("export_types"))
@@ -542,6 +555,21 @@ class App(_BaseTk):
         if path:
             self.psdz_var.set(path)
 
+    def _browse_psdz_archive(self) -> None:
+        current = self.psdz_var.get() or os.getcwd()
+        initial = str(Path(current).parent) if is_archive(current) else current
+        pattern = " ".join(f"*{ext}" for ext in sorted(ARCHIVE_SUFFIXES))
+        path = filedialog.askopenfilename(
+            title=self.tr("browse_archive"),
+            initialdir=initial,
+            filetypes=[
+                (self.tr("browse_archive"), pattern),
+                (self.tr("filetypes_all"), "*.*"),
+            ],
+        )
+        if path:
+            self.psdz_var.set(path)
+
     def _browse_xml(self, variable: tk.StringVar) -> None:
         current = variable.get() or self.svt_var.get()
         path = filedialog.askopenfilename(
@@ -576,6 +604,9 @@ class App(_BaseTk):
         """Files dropped on the window or on the exe."""
         xmls = [path for path in paths if path.is_file() and path.suffix.lower() == ".xml"]
         for path in paths:
+            if path.is_file() and is_archive(path):
+                self.psdz_var.set(str(path))
+                continue
             if path.is_dir():
                 try:
                     resolve_swe_root(path)
@@ -659,17 +690,49 @@ class App(_BaseTk):
         threading.Thread(target=self._search_worker, args=(psdz, mode, files), daemon=True).start()
 
     def _build_index(self, psdz: str):
-        swe = resolve_swe_root(psdz)
-        self.after(0, lambda: self.log_line(f"SWE: {swe}"))
-        index = build_index(
-            swe,
-            progress=lambda n, kind: self.after(
-                0, lambda n=n, kind=kind: self.status_var.set(self.tr("status_index", kind=kind, count=n))
-            ),
-        )
+        if is_archive(psdz):
+            self.archive_path = Path(psdz)
+            self.staging_dir = new_staging_dir()
+            self.after(0, lambda: self.log_line(f"{self.tr('log_archive')}: {psdz}"))
+            index = build_archive_index(
+                psdz,
+                progress=lambda n, kind: self.after(
+                    0, lambda n=n, kind=kind: self.status_var.set(self.tr("status_index", kind=kind, count=n))
+                ),
+            )
+        else:
+            self.archive_path = None
+            self._cleanup_staging()
+            swe = resolve_swe_root(psdz)
+            self.after(0, lambda: self.log_line(f"SWE: {swe}"))
+            index = build_index(
+                swe,
+                progress=lambda n, kind: self.after(
+                    0, lambda n=n, kind=kind: self.status_var.set(self.tr("status_index", kind=kind, count=n))
+                ),
+            )
         counts = ", ".join(f"{k}={v}" for k, v in sorted(index.kind_counts.items())) or self.tr("log_empty")
         self.after(0, lambda: self.log_line(self.tr("log_index", count=index.file_count, counts=counts)))
         return index
+
+    def _cleanup_staging(self) -> None:
+        if self.staging_dir is not None:
+            shutil.rmtree(self.staging_dir, ignore_errors=True)
+        self.staging_dir = None
+
+    def _extract_progress(self):
+        def progress(done, total, name):
+            self.after(0, lambda: self.status_var.set(self.tr("status_extract", done=done, total=total, name=name)))
+
+        return progress
+
+    def _extract_matches(self, matches) -> None:
+        """Worker thread: pull the needed files out of the PSdZData archive."""
+        if self.archive_path is None or self.staging_dir is None:
+            return
+        errors = ensure_extracted(matches, self.archive_path, self.staging_dir, progress=self._extract_progress())
+        for err in errors:
+            self.after(0, lambda e=err: self.log_line(self.tr("log_err", detail=e)))
 
     def _search_worker(self, psdz: str, mode: str, files: list[str]) -> None:
         try:
@@ -681,6 +744,7 @@ class App(_BaseTk):
                         doc = load_document(item)
                         matches = match_svt(doc, index)
                         self._auto_nearest(matches, index)
+                        self._extract_matches(matches)
                         results[item] = {"doc": doc, "matches": matches, "error": ""}
                     except Exception as exc:  # one bad file must not stop the batch
                         results[item] = {"doc": None, "matches": [], "error": self._format_error(exc)}
@@ -696,28 +760,17 @@ class App(_BaseTk):
                 doc = load_document(files[0])
             self.after(0, lambda: self.log_line(self.tr("log_ecus", ecus=len(doc.ecus), parts=len(doc.parts))))
             index = self._build_index(psdz)
-            self.after(0, lambda: self._apply_search(doc, doc_ist, index))
+            matches = match_diff(doc_ist, doc, index) if doc_ist is not None else match_svt(doc, index)
+            self._auto_nearest(matches, index)
+            self._extract_matches(matches)
+            self.after(0, lambda: self._apply_search_results(doc, doc_ist, index, matches))
         except Exception as exc:
             error = traceback.format_exc()
             self.after(0, lambda: self._search_failed(exc, error))
 
-    def _auto_nearest(self, matches, index) -> None:
-        if not self.nearest_var.get():
-            return
-        for match in matches:
-            if match.part.process_class and not match.found and match.other_versions:
-                version = nearest_version(match)
-                if version:
-                    apply_override(match, index, version)
-
-    def _apply_search(self, doc, doc_ist, index) -> None:
+    def _apply_search_results(self, doc, doc_ist, index, matches) -> None:
         classes = sorted({part.process_class for _, part in doc.parts if part.process_class})
         self._set_class_checks(classes)
-        if doc_ist is not None:
-            matches = match_diff(doc_ist, doc, index)
-        else:
-            matches = match_svt(doc, index)
-        self._auto_nearest(matches, index)
         self.doc = doc
         self.doc_ist = doc_ist
         self.index = index
@@ -734,6 +787,15 @@ class App(_BaseTk):
         self._refresh_selection_status()
         if self._on_search_done:
             self._on_search_done()
+
+    def _auto_nearest(self, matches, index) -> None:
+        if not self.nearest_var.get():
+            return
+        for match in matches:
+            if match.part.process_class and not match.found and match.other_versions:
+                version = nearest_version(match)
+                if version:
+                    apply_override(match, index, version)
 
     def _refresh_summary(self) -> None:
         stats = summarize(self.matches)
@@ -763,6 +825,8 @@ class App(_BaseTk):
     def _format_error(self, exc: Exception) -> str:
         if isinstance(exc, ValueError) and str(exc) == "no_ecu":
             return self.tr("err_no_ecu")
+        if isinstance(exc, ArchiveError) and str(exc) == "7z_requires_py7zr":
+            return self.tr("err_7z")
         if isinstance(exc, FileNotFoundError):
             return self.tr("err_no_swe", path=exc)
         return str(exc)
@@ -936,6 +1000,9 @@ class App(_BaseTk):
                     apply_override(match, self.index, version)
             elif not self.nearest_var.get() and match.override_version:
                 apply_override(match, self.index, "")
+        if self.archive_path is not None:
+            self.status_var.set(self.tr("status_extracting"))
+            self._extract_matches(self.matches)
         self._render_tree()
         self._refresh_summary()
 
@@ -1036,6 +1103,9 @@ class App(_BaseTk):
         apply_override(match, self.index, version)
         if match.found and iid in self.checked:
             self.checked[iid] = True
+        if self.archive_path is not None:
+            self.status_var.set(self.tr("status_extracting"))
+            self._extract_matches([match])
         values, tag = self._row(match)
         if self.tree.exists(iid):
             self.tree.item(iid, values=values, tags=(tag,))
@@ -1483,6 +1553,7 @@ class App(_BaseTk):
 
     def _on_close(self) -> None:
         self._persist()
+        self._cleanup_staging()
         self.destroy()
 
 
@@ -1583,7 +1654,15 @@ class MissingDialog(tk.Toplevel):
 
 # -------------------------------------------------------------------- CLI
 def run_cli(args) -> None:
-    index = build_index(resolve_swe_root(args.psdz))
+    archive = None
+    staging = None
+    if is_archive(args.psdz):
+        archive = Path(args.psdz)
+        staging = new_staging_dir()
+        index = build_archive_index(archive)
+        print(f"Archive: {archive}")
+    else:
+        index = build_index(resolve_swe_root(args.psdz))
     kwargs = {"use_hash": args.hash, "hardlink": args.hardlink, "make_zip": args.zip or bool(args.mega)}
 
     def pick(matches):
@@ -1609,35 +1688,44 @@ def run_cli(args) -> None:
         jobs.append((Path(args.svt), load_document(args.svt), None, Path(args.out)))
 
     failed = False
-    for path, doc, ist, dest in jobs:
-        matches = match_diff(ist, doc, index) if ist is not None else match_svt(doc, index)
-        report, export = pick(matches)
-        stats = summarize(report)
-        print(f"{path.name}: ECU {len(doc.ecus)}, found {stats['found']}/{stats['parts']}, missing {stats['missing']}")
-        if ist is not None:
-            print(f"  changed {stats['changed']}, unchanged {stats['same']}")
-        copied, skipped, errors = export_matches(
-            export, dest, args.layout, all_matches=report, meta={"Source": str(path)}, **kwargs
-        )
-        print(f"  -> {dest}: copied {copied}, skipped {skipped}, errors {len(errors)}")
-        for err in errors:
-            print("ERR", err)
-        failed = failed or bool(errors)
-        if args.mega:
-            try:
-                link = mega.upload(dest.with_name(dest.name + ".zip"), args.mega)
-                print(f"  MEGA: {link}")
-            except mega.MegaError as exc:
-                print(f"  MEGA failed ({exc.code}): {exc.detail}")
-                failed = True
-        if args.missing_report:
-            target = Path(args.missing_report)
-            if len(jobs) > 1:
-                target = dest / target.name
-            fmt = "csv" if target.suffix.lower() == ".csv" else "forum"
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(missing_report(report, fmt, istep=doc.istep, psdz_name=Path(args.psdz).name), encoding="utf-8")
-            print(f"  missing list: {target}")
+    try:
+        for path, doc, ist, dest in jobs:
+            matches = match_diff(ist, doc, index) if ist is not None else match_svt(doc, index)
+            report, export = pick(matches)
+            stats = summarize(report)
+            print(f"{path.name}: ECU {len(doc.ecus)}, found {stats['found']}/{stats['parts']}, missing {stats['missing']}")
+            if ist is not None:
+                print(f"  changed {stats['changed']}, unchanged {stats['same']}")
+            errors: list[str] = []
+            if archive is not None:
+                errors = ensure_extracted(export, archive, staging)
+                for err in errors:
+                    print("ERR", err)
+            copied, skipped, errors = export_matches(
+                export, dest, args.layout, all_matches=report, meta={"Source": str(path)}, **kwargs
+            )
+            print(f"  -> {dest}: copied {copied}, skipped {skipped}, errors {len(errors)}")
+            for err in errors:
+                print("ERR", err)
+            failed = failed or bool(errors)
+            if args.mega:
+                try:
+                    link = mega.upload(dest.with_name(dest.name + ".zip"), args.mega)
+                    print(f"  MEGA: {link}")
+                except mega.MegaError as exc:
+                    print(f"  MEGA failed ({exc.code}): {exc.detail}")
+                    failed = True
+            if args.missing_report:
+                target = Path(args.missing_report)
+                if len(jobs) > 1:
+                    target = dest / target.name
+                fmt = "csv" if target.suffix.lower() == ".csv" else "forum"
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(missing_report(report, fmt, istep=doc.istep, psdz_name=Path(args.psdz).name), encoding="utf-8")
+                print(f"  missing list: {target}")
+    finally:
+        if staging is not None:
+            shutil.rmtree(staging, ignore_errors=True)
     if failed:
         raise SystemExit(1)
 
@@ -1649,7 +1737,7 @@ def main() -> None:
     parser.add_argument("--soll", help="Target SVT-Soll: export only what changes against --svt")
     parser.add_argument("--tal", help="TAL XML from E-Sys")
     parser.add_argument("--batch", nargs="+", help="Several SVT files, one subfolder per car")
-    parser.add_argument("--psdz", help="PSdZData folder")
+    parser.add_argument("--psdz", help="PSdZData folder or .zip/.7z archive")
     parser.add_argument("--out", help="Export folder")
     parser.add_argument("--layout", choices=list(LAYOUTS), default="psdzdata")
     parser.add_argument("--all-parts", action="store_true", help="With --soll: also export unchanged parts")
@@ -1669,7 +1757,12 @@ def main() -> None:
     parser.add_argument("--demo", action="store_true", help="Open GUI with demo data")
     args = parser.parse_args()
     if args.psdz and args.out and (args.svt or args.tal or args.batch):
-        run_cli(args)
+        try:
+            run_cli(args)
+        except ArchiveError as exc:
+            print(str(exc) if str(exc) != "7z_requires_py7zr" else
+                  "7z archives need the Python package py7zr:  py -3 -m pip install py7zr")
+            raise SystemExit(1)
         return
     app = App(lang=args.lang)
     if args.demo:

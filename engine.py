@@ -6,6 +6,7 @@ import io
 import os
 import re
 import shutil
+import tempfile
 import zipfile
 from collections import defaultdict
 from dataclasses import dataclass, field, replace
@@ -389,6 +390,169 @@ def _looks_like_swe(path: Path) -> bool:
     if names.intersection(SWE_KIND_DIRS):
         return True
     return any(SWE_NAME_RE.match(child.name) for child in path.iterdir() if child.is_file())
+
+
+# ------------------------------------------------------------------ archives
+ARCHIVE_SUFFIXES = frozenset({".zip", ".7z"})
+
+
+class ArchiveError(RuntimeError):
+    pass
+
+
+def is_archive(path: str | Path) -> bool:
+    return Path(path).suffix.lower() in ARCHIVE_SUFFIXES
+
+
+class ArchiveReader:
+    """Random access to the members of a PSdZData .zip or .7z archive."""
+
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path)
+        self._zip: zipfile.ZipFile | None = None
+        self._7z = None
+        if self.path.suffix.lower() == ".zip":
+            try:
+                self._zip = zipfile.ZipFile(self.path)
+            except (OSError, zipfile.BadZipFile) as exc:
+                raise ArchiveError(f"{self.path.name}: {exc}") from exc
+            self._names = [info.filename for info in self._zip.infolist() if not info.is_dir()]
+        else:
+            try:
+                import py7zr
+            except ImportError as exc:
+                raise ArchiveError("7z_requires_py7zr") from exc
+            self._7z = py7zr
+            try:
+                with py7zr.SevenZipFile(self.path, mode="r") as archive:
+                    self._names = [entry.filename for entry in archive.list() if not entry.is_directory]
+            except Exception as exc:
+                raise ArchiveError(f"{self.path.name}: {exc}") from exc
+
+    def names(self) -> list[str]:
+        return self._names
+
+    def extract(self, member: str, dest: Path) -> None:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if self._zip is not None:
+            try:
+                with self._zip.open(member) as src, dest.open("wb") as out:
+                    shutil.copyfileobj(src, out, 1024 * 1024)
+            except KeyError as exc:
+                raise ArchiveError(f"{member}: not in archive") from exc
+            return
+        # 7z: py7zr extracts preserving the member's folders, so unpack into a
+        # scratch dir next to dest and move the produced file into place.
+        with tempfile.TemporaryDirectory(dir=dest.parent) as scratch:
+            with self._7z.SevenZipFile(self.path, mode="r") as archive:
+                archive.extract(targets=[member], path=scratch)
+            produced = Path(scratch) / member
+            if not produced.is_file():
+                hits = [item for item in Path(scratch).rglob(dest.name) if item.is_file()]
+                if not hits:
+                    raise ArchiveError(f"{member}: not in archive")
+                produced = hits[0]
+            shutil.move(str(produced), dest)
+
+    def close(self) -> None:
+        if self._zip is not None:
+            self._zip.close()
+
+    def __enter__(self) -> "ArchiveReader":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+
+def build_archive_index(archive: str | Path, progress=None) -> SweIndex:
+    """Index the SWE files inside a PSdZData archive without extracting it.
+
+    The index maps part keys to in-archive member paths; they become real
+    files under a staging folder after ensure_extracted() runs.
+    """
+    path = Path(archive)
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    candidates: dict[tuple[str, str, str], dict[str, int]] = defaultdict(dict)
+    versions: dict[tuple[str, str], set[str]] = defaultdict(set)
+    kind_counts: dict[str, int] = defaultdict(int)
+    counted = 0
+    with ArchiveReader(path) as reader:
+        for member in reader.names():
+            name = member.rsplit("/", 1)[-1]
+            parsed = SWE_NAME_RE.match(name)
+            if not parsed:
+                continue
+            kind = parsed.group("kind").lower()
+            ident = parsed.group("ident").lower()
+            version = parsed.group("ver")
+            # The same file can ship in several folders (swe, mainseries, ...);
+            # prefer the copy under a real swe directory.
+            priority = 1 if any(part.lower() == "swe" for part in member.split("/")[:-1]) else 0
+            candidates[(kind, ident, version)][member] = priority
+            versions[(kind, ident)].add(version)
+            kind_counts[kind] += 1
+            counted += 1
+            if progress and counted % 2500 == 0:
+                progress(counted, kind)
+    files: dict[tuple[str, str, str], list[Path]] = {}
+    for key, members in candidates.items():
+        top = max(members.values())
+        files[key] = sorted(Path(member) for member, prio in members.items() if prio == top)
+    return SweIndex(
+        swe_root=path,
+        files=files,
+        versions={key: sorted(values) for key, values in versions.items()},
+        file_count=counted,
+        kind_counts=dict(kind_counts),
+    )
+
+
+def new_staging_dir() -> Path:
+    return Path(tempfile.mkdtemp(prefix="svt_export_psdz_"))
+
+
+def ensure_extracted(
+    matches: list[PartMatch],
+    archive: str | Path,
+    staging: str | Path,
+    progress=None,
+) -> list[str]:
+    """Point the found matches at real files under staging.
+
+    Archive indexes store in-archive member paths; this extracts the needed
+    members only (already extracted ones are reused) and rewrites match.files.
+    Returns error strings.
+    """
+    staging_path = Path(staging)
+    todo: dict[Path, str] = {}
+    for match in matches:
+        if not match.found or all(path.exists() for path in match.files):
+            continue
+        mapped = []
+        for pseudo in match.files:
+            parsed = SWE_NAME_RE.match(pseudo.name)
+            rel = f"{parsed.group('kind').lower()}/{pseudo.name}" if parsed else pseudo.name
+            dest = staging_path / rel
+            if not dest.exists():
+                todo[dest] = pseudo.as_posix()
+            mapped.append(dest)
+        match.files = mapped
+    if not todo:
+        return []
+    errors: list[str] = []
+    done = 0
+    with ArchiveReader(archive) as reader:
+        for dest, member in todo.items():
+            try:
+                reader.extract(member, dest)
+            except (ArchiveError, OSError) as exc:
+                errors.append(f"{member}: {exc}")
+            done += 1
+            if progress:
+                progress(done, len(todo), dest.name)
+    return errors
 
 
 def build_index(swe_root: str | Path, progress=None) -> SweIndex:
