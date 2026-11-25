@@ -6,8 +6,10 @@ import io
 import os
 import re
 import shutil
+import struct
 import tempfile
 import zipfile
+import zlib
 from collections import defaultdict
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -405,18 +407,31 @@ def is_archive(path: str | Path) -> bool:
 
 
 class ArchiveReader:
-    """Random access to the members of a PSdZData .zip or .7z archive."""
+    """Random access to the members of a PSdZData .zip or .7z archive.
+
+    Full PSdZData packs hold millions of files. zipfile loads the whole
+    central directory (multi-GB) plus one object per entry into memory, so
+    for .zip the directory is parsed streaming instead and only SWE files
+    are kept. Keep one reader open for the whole session: reopening would
+    re-read the central directory over the network.
+    """
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
-        self._zip: zipfile.ZipFile | None = None
         self._7z = None
+        self._fh = None
+        # name -> (local_offset, comp_size, uncomp_size, method, crc, flags)
+        self._swe: dict[str, tuple[int, int, int, int, int, int]] = {}
         if self.path.suffix.lower() == ".zip":
             try:
-                self._zip = zipfile.ZipFile(self.path)
-            except (OSError, zipfile.BadZipFile) as exc:
+                self._fh = open(self.path, "rb", buffering=4 * 1024 * 1024)
+                self._read_zip_directory()
+            except ArchiveError:
+                self.close()
+                raise
+            except OSError as exc:
+                self.close()
                 raise ArchiveError(f"{self.path.name}: {exc}") from exc
-            self._names = [info.filename for info in self._zip.infolist() if not info.is_dir()]
         else:
             try:
                 import py7zr
@@ -429,17 +444,171 @@ class ArchiveReader:
             except Exception as exc:
                 raise ArchiveError(f"{self.path.name}: {exc}") from exc
 
-    def names(self) -> list[str]:
-        return self._names
+    # ---- zip ---------------------------------------------------------
+    def _read_zip_directory(self) -> None:
+        fh = self._fh
+        file_size = fh.seek(0, os.SEEK_END)
+        scan = min(file_size, 65536 + 22)
+        fh.seek(file_size - scan)
+        tail = fh.read(scan)
+        eocd = tail.rfind(b"PK\x05\x06")
+        if eocd < 0:
+            raise ArchiveError(f"{self.path.name}: not a zip archive")
+        disk, cd_disk, _, total_entries, cd_size, cd_offset = struct.unpack_from("<HHHHII", tail, eocd + 4)
+        if disk or cd_disk:
+            raise ArchiveError(f"{self.path.name}: multi-disk zip archives are not supported")
+        if cd_size == 0xFFFFFFFF or cd_offset == 0xFFFFFFFF or total_entries == 0xFFFF:
+            loc = tail.rfind(b"PK\x06\x07")
+            if loc < 0:
+                raise ArchiveError(f"{self.path.name}: zip64 end record is missing")
+            (z64_offset,) = struct.unpack_from("<Q", tail, loc + 8)
+            fh.seek(z64_offset)
+            head = fh.read(56)
+            if len(head) < 56 or head[:4] != b"PK\x06\x06":
+                raise ArchiveError(f"{self.path.name}: broken zip64 end record")
+            z64_disk, z64_cd_disk, z64_entries, z64_total, cd_size, cd_offset = struct.unpack_from(
+                "<IIQQQQ", head, 16
+            )
+            if z64_disk or z64_cd_disk:
+                raise ArchiveError(f"{self.path.name}: multi-disk zip archives are not supported")
+            if total_entries in (0xFFFF, 0xFFFFFFFF) or cd_size == 0xFFFFFFFF or cd_offset == 0xFFFFFFFF:
+                total_entries = z64_total
+
+        fh.seek(cd_offset)
+        remaining = cd_size
+        buf = bytearray()
+        pos = 0
+        parsed = 0
+        while True:
+            if len(buf) - pos < 46:
+                if remaining <= 0:
+                    break
+                chunk = fh.read(min(4 * 1024 * 1024, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+                if pos:
+                    del buf[:pos]
+                    pos = 0
+                buf += chunk
+                continue
+            if bytes(buf[pos:pos + 4]) != b"PK\x01\x02":
+                raise ArchiveError(f"{self.path.name}: corrupt zip central directory")
+            (
+                _, _, flags, method, _, _,
+                crc, csize, usize,
+                name_len, extra_len, comment_len,
+                _, _, _, offset,
+            ) = struct.unpack_from("<HHHHHHIIIHHHHHII", buf, pos + 4)
+            entry_len = 46 + name_len + extra_len + comment_len
+            if len(buf) - pos < entry_len:
+                if remaining <= 0:
+                    raise ArchiveError(f"{self.path.name}: truncated zip central directory")
+                chunk = fh.read(min(4 * 1024 * 1024, remaining))
+                if not chunk:
+                    raise ArchiveError(f"{self.path.name}: truncated zip central directory")
+                remaining -= len(chunk)
+                if pos:
+                    del buf[:pos]
+                    pos = 0
+                buf += chunk
+                continue
+            name = bytes(buf[pos + 46:pos + 46 + name_len]).decode(
+                "utf-8" if flags & 0x800 else "cp437"
+            ).replace("\\", "/")
+            if csize == 0xFFFFFFFF or usize == 0xFFFFFFFF or offset == 0xFFFFFFFF:
+                csize, usize, offset = self._zip64_extra(
+                    bytes(buf[pos + 46 + name_len:pos + 46 + name_len + extra_len]),
+                    csize, usize, offset,
+                )
+            parsed += 1
+            pos += entry_len
+            if not SWE_NAME_RE.match(name.rsplit("/", 1)[-1]):
+                continue
+            self._swe[name] = (offset, csize, usize, method, crc, flags)
+        if parsed != total_entries:
+            raise ArchiveError(f"{self.path.name}: incomplete zip central directory")
+
+    @staticmethod
+    def _zip64_extra(extra: bytes, csize: int, usize: int, offset: int) -> tuple[int, int, int]:
+        i = 0
+        while i + 4 <= len(extra):
+            header, size = struct.unpack_from("<HH", extra, i)
+            body = extra[i + 4:i + 4 + size]
+            if header == 0x0001:
+                pos = 0
+                if usize == 0xFFFFFFFF and pos + 8 <= len(body):
+                    (usize,) = struct.unpack_from("<Q", body, pos)
+                    pos += 8
+                if csize == 0xFFFFFFFF and pos + 8 <= len(body):
+                    (csize,) = struct.unpack_from("<Q", body, pos)
+                    pos += 8
+                if offset == 0xFFFFFFFF and pos + 8 <= len(body):
+                    (offset,) = struct.unpack_from("<Q", body, pos)
+            i += 4 + size
+        return csize, usize, offset
+
+    def _extract_zip(self, member: str, dest: Path) -> None:
+        entry = self._swe.get(member)
+        if entry is None:
+            raise ArchiveError(f"{member}: not in archive")
+        offset, csize, usize, method, crc, flags = entry
+        if flags & 0x1:
+            raise ArchiveError(f"{member}: encrypted entries are not supported")
+        if method not in (0, 8):
+            raise ArchiveError(f"{member}: zip compression method {method} is not supported")
+        fh = self._fh
+        fh.seek(offset)
+        head = fh.read(30)
+        if len(head) < 30 or head[:4] != b"PK\x03\x04":
+            raise ArchiveError(f"{member}: broken zip local header")
+        name_len, extra_len = struct.unpack_from("<HH", head, 26)
+        fh.seek(name_len + extra_len, os.SEEK_CUR)
+        crc_seen = 0
+        written = 0
+        decompressor = None
+        with dest.open("wb") as out:
+            left = csize
+            while left:
+                chunk = fh.read(min(1024 * 1024, left))
+                if not chunk:
+                    raise ArchiveError(f"{member}: truncated archive data")
+                left -= len(chunk)
+                if method == 0:
+                    out.write(chunk)
+                    written += len(chunk)
+                    crc_seen = zlib.crc32(chunk, crc_seen)
+                else:
+                    if decompressor is None:
+                        decompressor = zlib.decompressobj(-15)
+                    data = decompressor.decompress(chunk)
+                    if data:
+                        out.write(data)
+                        written += len(data)
+                        crc_seen = zlib.crc32(data, crc_seen)
+            if method == 8:
+                data = decompressor.flush()
+                if data:
+                    out.write(data)
+                    written += len(data)
+                    crc_seen = zlib.crc32(data, crc_seen)
+                if not decompressor.eof:
+                    raise ArchiveError(f"{member}: truncated archive data")
+        if written != usize or crc_seen != crc:
+            raise ArchiveError(f"{member}: corrupt archive data (size/crc mismatch)")
+
+    # ---- common ------------------------------------------------------
+    def iter_names(self):
+        """Yield member names. For .zip only SWE-named files (see class doc)."""
+        if self._fh is not None:
+            yield from self._swe
+            return
+        yield from self._names
 
     def extract(self, member: str, dest: Path) -> None:
         dest.parent.mkdir(parents=True, exist_ok=True)
-        if self._zip is not None:
-            try:
-                with self._zip.open(member) as src, dest.open("wb") as out:
-                    shutil.copyfileobj(src, out, 1024 * 1024)
-            except KeyError as exc:
-                raise ArchiveError(f"{member}: not in archive") from exc
+        if self._fh is not None:
+            self._extract_zip(member, dest)
             return
         # 7z: py7zr extracts preserving the member's folders, so unpack into a
         # scratch dir next to dest and move the produced file into place.
@@ -455,8 +624,11 @@ class ArchiveReader:
             shutil.move(str(produced), dest)
 
     def close(self) -> None:
-        if self._zip is not None:
-            self._zip.close()
+        if self._fh is not None:
+            try:
+                self._fh.close()
+            finally:
+                self._fh = None
 
     def __enter__(self) -> "ArchiveReader":
         return self
@@ -465,23 +637,28 @@ class ArchiveReader:
         self.close()
 
 
-def build_archive_index(archive: str | Path, progress=None) -> SweIndex:
+def build_archive_index(source: "str | Path | ArchiveReader", progress=None) -> SweIndex:
     """Index the SWE files inside a PSdZData archive without extracting it.
 
     The index maps part keys to in-archive member paths; they become real
-    files under a staging folder after ensure_extracted() runs.
+    files under a staging folder after ensure_extracted() runs. Pass an
+    already open ArchiveReader to avoid re-reading the archive directory.
     """
-    path = Path(archive)
-    if not path.is_file():
-        raise FileNotFoundError(path)
+    if isinstance(source, ArchiveReader):
+        reader = source
+        archive_path = reader.path
+    else:
+        archive_path = Path(source)
+        if not archive_path.is_file():
+            raise FileNotFoundError(archive_path)
+        reader = ArchiveReader(archive_path)
     candidates: dict[tuple[str, str, str], dict[str, int]] = defaultdict(dict)
     versions: dict[tuple[str, str], set[str]] = defaultdict(set)
     kind_counts: dict[str, int] = defaultdict(int)
     counted = 0
-    with ArchiveReader(path) as reader:
-        for member in reader.names():
-            name = member.rsplit("/", 1)[-1]
-            parsed = SWE_NAME_RE.match(name)
+    try:
+        for member in reader.iter_names():
+            parsed = SWE_NAME_RE.match(member.rsplit("/", 1)[-1])
             if not parsed:
                 continue
             kind = parsed.group("kind").lower()
@@ -496,12 +673,15 @@ def build_archive_index(archive: str | Path, progress=None) -> SweIndex:
             counted += 1
             if progress and counted % 2500 == 0:
                 progress(counted, kind)
+    finally:
+        if reader is not source:
+            reader.close()
     files: dict[tuple[str, str, str], list[Path]] = {}
     for key, members in candidates.items():
         top = max(members.values())
         files[key] = sorted(Path(member) for member, prio in members.items() if prio == top)
     return SweIndex(
-        swe_root=path,
+        swe_root=archive_path,
         files=files,
         versions={key: sorted(values) for key, values in versions.items()},
         file_count=counted,
@@ -515,7 +695,7 @@ def new_staging_dir() -> Path:
 
 def ensure_extracted(
     matches: list[PartMatch],
-    archive: str | Path,
+    archive: "str | Path | ArchiveReader",
     staging: str | Path,
     progress=None,
 ) -> list[str]:
@@ -523,8 +703,21 @@ def ensure_extracted(
 
     Archive indexes store in-archive member paths; this extracts the needed
     members only (already extracted ones are reused) and rewrites match.files.
-    Returns error strings.
+    Pass an already open ArchiveReader to avoid re-reading the archive
+    directory. Returns error strings.
     """
+    if isinstance(archive, ArchiveReader):
+        return _extract_needed(archive, matches, staging, progress)
+    with ArchiveReader(archive) as reader:
+        return _extract_needed(reader, matches, staging, progress)
+
+
+def _extract_needed(
+    reader: ArchiveReader,
+    matches: list[PartMatch],
+    staging: str | Path,
+    progress=None,
+) -> list[str]:
     staging_path = Path(staging)
     todo: dict[Path, str] = {}
     for match in matches:
@@ -543,15 +736,14 @@ def ensure_extracted(
         return []
     errors: list[str] = []
     done = 0
-    with ArchiveReader(archive) as reader:
-        for dest, member in todo.items():
-            try:
-                reader.extract(member, dest)
-            except (ArchiveError, OSError) as exc:
-                errors.append(f"{member}: {exc}")
-            done += 1
-            if progress:
-                progress(done, len(todo), dest.name)
+    for dest, member in todo.items():
+        try:
+            reader.extract(member, dest)
+        except (ArchiveError, OSError) as exc:
+            errors.append(f"{member}: {exc}")
+        done += 1
+        if progress:
+            progress(done, len(todo), dest.name)
     return errors
 
 

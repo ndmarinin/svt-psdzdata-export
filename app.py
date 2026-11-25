@@ -16,6 +16,7 @@ import tkinter as tk
 from engine import (
     ARCHIVE_SUFFIXES,
     ArchiveError,
+    ArchiveReader,
     CHANGE_NEW,
     CHANGE_SAME,
     CHANGE_UPDATE,
@@ -158,6 +159,7 @@ class App(_BaseTk):
         self.mega_errors: list[str] = []
         self.batch_files = [item for item in cfg.get("batch", []) if isinstance(item, str)]
         self.archive_path: Path | None = None
+        self.archive_reader: ArchiveReader | None = None
         self.staging_dir: Path | None = None
 
         self._build()
@@ -693,9 +695,10 @@ class App(_BaseTk):
         if is_archive(psdz):
             self.archive_path = Path(psdz)
             self.staging_dir = new_staging_dir()
+            self.archive_reader = ArchiveReader(psdz)
             self.after(0, lambda: self.log_line(f"{self.tr('log_archive')}: {psdz}"))
             index = build_archive_index(
-                psdz,
+                self.archive_reader,
                 progress=lambda n, kind: self.after(
                     0, lambda n=n, kind=kind: self.status_var.set(self.tr("status_index", kind=kind, count=n))
                 ),
@@ -716,6 +719,9 @@ class App(_BaseTk):
         return index
 
     def _cleanup_staging(self) -> None:
+        if self.archive_reader is not None:
+            self.archive_reader.close()
+            self.archive_reader = None
         if self.staging_dir is not None:
             shutil.rmtree(self.staging_dir, ignore_errors=True)
         self.staging_dir = None
@@ -728,9 +734,9 @@ class App(_BaseTk):
 
     def _extract_matches(self, matches) -> None:
         """Worker thread: pull the needed files out of the PSdZData archive."""
-        if self.archive_path is None or self.staging_dir is None:
+        if self.archive_reader is None or self.staging_dir is None:
             return
-        errors = ensure_extracted(matches, self.archive_path, self.staging_dir, progress=self._extract_progress())
+        errors = ensure_extracted(matches, self.archive_reader, self.staging_dir, progress=self._extract_progress())
         for err in errors:
             self.after(0, lambda e=err: self.log_line(self.tr("log_err", detail=e)))
 
@@ -1656,10 +1662,12 @@ class MissingDialog(tk.Toplevel):
 def run_cli(args) -> None:
     archive = None
     staging = None
+    reader = None
     if is_archive(args.psdz):
         archive = Path(args.psdz)
         staging = new_staging_dir()
-        index = build_archive_index(archive)
+        reader = ArchiveReader(archive)
+        index = build_archive_index(reader)
         print(f"Archive: {archive}")
     else:
         index = build_index(resolve_swe_root(args.psdz))
@@ -1697,8 +1705,8 @@ def run_cli(args) -> None:
             if ist is not None:
                 print(f"  changed {stats['changed']}, unchanged {stats['same']}")
             errors: list[str] = []
-            if archive is not None:
-                errors = ensure_extracted(export, archive, staging)
+            if reader is not None:
+                errors = ensure_extracted(export, reader, staging)
                 for err in errors:
                     print("ERR", err)
             copied, skipped, errors = export_matches(
@@ -1724,6 +1732,8 @@ def run_cli(args) -> None:
                 target.write_text(missing_report(report, fmt, istep=doc.istep, psdz_name=Path(args.psdz).name), encoding="utf-8")
                 print(f"  missing list: {target}")
     finally:
+        if reader is not None:
+            reader.close()
         if staging is not None:
             shutil.rmtree(staging, ignore_errors=True)
     if failed:
