@@ -826,7 +826,13 @@ class App(_BaseTk):
         self.progress.stop()
         self.progress.configure(mode="determinate", value=0)
         self.status_var.set(self.tr("status_search_error"))
-        self.log_line(error or traceback.format_exc())
+        if isinstance(exc, (ArchiveError, FileNotFoundError)) or (
+            isinstance(exc, ValueError) and str(exc) == "no_ecu"
+        ):
+            # A known, expected failure: log the message, not the traceback.
+            self.log_line(self._format_error(exc))
+        else:
+            self.log_line(error or traceback.format_exc())
         self._set_busy(False)
         messagebox.showerror(self.tr("app_title"), self._format_error(exc))
 
