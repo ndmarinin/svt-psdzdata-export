@@ -9,6 +9,7 @@ import os
 import re
 import shutil
 import struct
+import subprocess
 import tempfile
 import time
 import zipfile
@@ -415,6 +416,33 @@ def is_archive(path: str | Path) -> bool:
     return Path(path).suffix.lower() in ARCHIVE_SUFFIXES
 
 
+def _find_7z_tool() -> str | None:
+    for name in ("7z", "7za"):
+        found = shutil.which(name)
+        if found:
+            return found
+    for env in ("ProgramFiles", "ProgramFiles(x86)"):
+        base = os.environ.get(env)
+        if base:
+            candidate = Path(base) / "7-Zip" / "7z.exe"
+            if candidate.is_file():
+                return str(candidate)
+    return None
+
+
+# " 47% 12 - psdzdata/swe/btld/btld_0000.bin.001_000_000"
+_7Z_PROGRESS_RE = re.compile(r"(\d{1,3})%\s+\S+\s+[-+]\s+(.+)")
+
+
+def _scratch_root(jobs: list[tuple[Path, str]]) -> Path:
+    """Where the 7-Zip tool may unpack: the staging root, if it exists."""
+    first = Path(jobs[0][0])
+    root = first.parent.parent
+    if root.is_dir():
+        return root
+    return first.parent if first.parent.is_dir() else Path(tempfile.gettempdir())
+
+
 class ArchiveReader:
     """Random access to the members of a PSdZData .zip or .7z archive.
 
@@ -423,11 +451,16 @@ class ArchiveReader:
     only SWE-named entries are kept in memory. The directory is read lazily
     (on first use) so a cached session can skip it entirely. Keep one reader
     open for the whole session: reopening would re-read the directory.
+
+    .7z archives are read through the 7-Zip tool when it is installed
+    (streaming, low memory, one sequential pass for all needed files);
+    py7zr is the fallback.
     """
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
         self._7z = None
+        self._7z_tool: str | None = None
         self._fh = None
         self._names: list[str] = []
         # name -> (local_offset, comp_size, uncomp_size, method, crc, flags)
@@ -448,12 +481,25 @@ class ArchiveReader:
                 self.close()
                 raise ArchiveError(f"{self.path.name}: {exc}") from exc
         else:
+            logger.info("Opening archive (read-only): %s (%.1f GB)", self.path, self.path.stat().st_size / 1e9)
+            self._7z_tool = _find_7z_tool()
+            if self._7z_tool:
+                # Stream the file list through the 7-Zip tool: a full pack has
+                # millions of entries and py7zr builds a Python object per
+                # entry (gigabytes of RAM), the tool stays flat.
+                logger.info("Listing via the 7-Zip tool: %s", self._7z_tool)
+                self._names = self._list_7z_cli()
+                self._ready = True
+                logger.info("7z header read: %d SWE files", len(self._names))
+                return
             try:
                 import py7zr
             except ImportError as exc:
                 raise ArchiveError("7z_requires_py7zr") from exc
             self._7z = py7zr
-            logger.info("Opening archive (read-only): %s (%.1f GB)", self.path, self.path.stat().st_size / 1e9)
+            logger.warning(
+                "The 7-Zip tool was not found, using py7zr — on huge archives it needs a lot of RAM"
+            )
             try:
                 with py7zr.SevenZipFile(self.path, mode="r") as archive:
                     # py7zr.list() is what getnames() is built on; only the
@@ -710,9 +756,88 @@ class ArchiveReader:
         if written != usize or crc_seen != crc:
             raise ArchiveError(f"{member}: corrupt archive data (size/crc mismatch)")
 
+    # ---- 7z via the tool ---------------------------------------------
+    def _list_7z_cli(self) -> list[str]:
+        names: list[str] = []
+        current: str | None = None
+        t0 = time.perf_counter()
+        try:
+            proc = subprocess.Popen(
+                [self._7z_tool, "l", "-slt", "-ba", str(self.path)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError as exc:
+            raise ArchiveError(f"{self._7z_tool}: {exc}") from exc
+        for raw in proc.stdout:
+            line = raw.decode("utf-8", "replace").strip()
+            if line.startswith("Path = "):
+                current = line[7:].replace("\\", "/")
+            elif line.startswith("Attributes = ") and current is not None:
+                if not line[13:].lstrip().startswith("D") and SWE_NAME_RE.match(current.rsplit("/", 1)[-1]):
+                    names.append(current)
+                current = None
+        proc.wait()
+        if proc.returncode != 0:
+            raise ArchiveError(f"{self.path.name}: 7z listing failed with code {proc.returncode}")
+        logger.info("7z listing took %.0f s", time.perf_counter() - t0)
+        return names
+
+    def _extract_batch(self, jobs: list[tuple[Path, str]], progress=None) -> list[str]:
+        """Extract all members in ONE sequential 7z pass (solid-friendly).
+
+        jobs: (dest, member). Returns error strings.
+        """
+        if not jobs:
+            return []
+        scratch = Path(tempfile.mkdtemp(prefix="svt7z_", dir=_scratch_root(jobs)))
+        errors: list[str] = []
+        try:
+            listfile = scratch / "members.txt"
+            listfile.write_text("\n".join(member for _, member in jobs), encoding="utf-8")
+            logger.info("Extracting %d files with one 7-Zip pass…", len(jobs))
+            proc = subprocess.Popen(
+                [
+                    self._7z_tool, "x", "-y",
+                    str(self.path),
+                    f"-o{scratch}",
+                    f"@{listfile}",
+                    "-bso0", "-bsp1",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            done = 0
+            for raw in proc.stdout:
+                line = raw.decode("utf-8", "replace")
+                matches = _7Z_PROGRESS_RE.findall(line)
+                if matches and progress:
+                    percent, name = matches[-1]
+                    progress(int(percent), 100, name.strip())
+            _, err = proc.communicate()
+            if proc.returncode != 0:
+                detail = err.decode("utf-8", "replace").strip().splitlines()[-1:] or ["?"]
+                raise ArchiveError(f"7z extraction failed: {detail[-1]}")
+            for dest, member in jobs:
+                produced = scratch / member
+                if produced.is_file():
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(produced), dest)
+                    done += 1
+                    if progress:
+                        progress(done, len(jobs), dest.name)
+                else:
+                    errors.append(f"{member}: 7z did not extract it")
+        except ArchiveError as exc:
+            errors.append(str(exc))
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
+        logger.info("7z batch extraction done: %d ok, %d errors", len(jobs) - len(errors), len(errors))
+        return errors
+
     # ---- common ------------------------------------------------------
     def iter_names(self):
-        """Yield member names. For .zip only SWE-named files (see class doc)."""
+        """Yield member names. Only SWE-named files are kept in memory."""
         if self._fh is not None:
             self._ensure_directory()
             yield from self._swe
@@ -725,7 +850,12 @@ class ArchiveReader:
             self._ensure_directory()
             self._extract_zip(member, dest)
             return
-        # 7z: py7zr extracts preserving the member's folders, so unpack into a
+        if self._7z_tool is not None:
+            errors = self._extract_batch([(dest, member)])
+            if errors:
+                raise ArchiveError(errors[0])
+            return
+        # py7zr extracts preserving the member's folders, so unpack into a
         # scratch dir next to dest and move the produced file into place.
         with tempfile.TemporaryDirectory(dir=dest.parent) as scratch:
             with self._7z.SevenZipFile(self.path, mode="r") as archive:
@@ -904,6 +1034,8 @@ def _extract_needed(
     if not todo:
         logger.info("Extraction: no files to pull from the archive")
         return []
+    if getattr(reader, "_7z_tool", None):
+        return reader._extract_batch(list(todo.items()), progress)
     errors: list[str] = []
     done = 0
     logger.info("Extracting %d files from the archive…", len(todo))
