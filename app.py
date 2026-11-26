@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import shutil
 import sys
@@ -659,6 +660,7 @@ class App(_BaseTk):
     def log_line(self, text: str) -> None:
         self.log.insert("end", text + "\n")
         self.log.see("end")
+        logging.getLogger("svt_export").info(text.replace("\n", "  •  "))
 
     # ---------------------------------------------------------------- search
     def start_search(self) -> None:
@@ -1740,6 +1742,16 @@ def run_cli(args) -> None:
         raise SystemExit(1)
 
 
+def setup_logging(verbose: bool = False, log_file: str | None = None) -> None:
+    fmt = "%(asctime)s %(levelname)-5s %(message)s"
+    handlers = []
+    if log_file:
+        handlers.append(logging.FileHandler(log_file, encoding="utf-8"))
+    else:
+        handlers.append(logging.StreamHandler())
+    logging.basicConfig(level=logging.DEBUG if verbose else logging.INFO, format=fmt, datefmt="%H:%M:%S", handlers=handlers)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=f"{APP_TITLE} {APP_VERSION}")
     parser.add_argument("files", nargs="*", help="SVT/TAL XML files or a PSdZData folder (drop onto the exe)")
@@ -1765,7 +1777,10 @@ def main() -> None:
     )
     parser.add_argument("--lang", choices=list(LANGS), help="UI language (default: system)")
     parser.add_argument("--demo", action="store_true", help="Open GUI with demo data")
+    parser.add_argument("--verbose", action="store_true", help="Verbose console logging (archive internals)")
+    parser.add_argument("--log-file", help="Also write logs to this file")
     args = parser.parse_args()
+    setup_logging(verbose=args.verbose, log_file=args.log_file)
     if args.psdz and args.out and (args.svt or args.tal or args.batch):
         try:
             run_cli(args)

@@ -4,17 +4,21 @@ import csv
 import hashlib
 import io
 import json
+import logging
 import os
 import re
 import shutil
 import struct
 import tempfile
+import time
 import zipfile
 import zlib
 from collections import defaultdict
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from xml.etree import ElementTree as ET
+
+logger = logging.getLogger("svt_export")
 
 SWE_NAME_RE = re.compile(
     r"^(?P<kind>[a-z0-9]+)_(?P<ident>[0-9a-fA-F]+)\.(?P<ext>[^.]+)\.(?P<ver>\d{3}_\d{3}_\d{3})$",
@@ -434,6 +438,7 @@ class ArchiveReader:
         self._total_entries = 0
         if self.path.suffix.lower() == ".zip":
             try:
+                logger.info("Opening archive (read-only): %s (%.1f GB)", self.path, self.path.stat().st_size / 1e9)
                 self._fh = open(self.path, "rb", buffering=4 * 1024 * 1024)
                 self._locate_zip_directory()
             except ArchiveError:
@@ -448,12 +453,21 @@ class ArchiveReader:
             except ImportError as exc:
                 raise ArchiveError("7z_requires_py7zr") from exc
             self._7z = py7zr
+            logger.info("Opening archive (read-only): %s (%.1f GB)", self.path, self.path.stat().st_size / 1e9)
             try:
                 with py7zr.SevenZipFile(self.path, mode="r") as archive:
-                    self._names = [entry.filename for entry in archive.list() if not entry.is_directory]
+                    # py7zr.list() is what getnames() is built on; only the
+                    # header is read. Keep SWE names only — a full pack has
+                    # millions of them.
+                    self._names = [
+                        entry.filename.replace("\\", "/")
+                        for entry in archive.list()
+                        if not entry.is_directory and SWE_NAME_RE.match(entry.filename.rsplit("/", 1)[-1])
+                    ]
             except Exception as exc:
                 raise ArchiveError(f"{self.path.name}: {exc}") from exc
             self._ready = True
+            logger.info("7z header read: %d SWE files", len(self._names))
 
     # ---- zip ---------------------------------------------------------
     def _locate_zip_directory(self) -> None:
@@ -488,6 +502,11 @@ class ArchiveReader:
         self._cd_offset = cd_offset
         self._cd_size = cd_size
         self._total_entries = total_entries
+        logger.info(
+            "Zip central directory: %.0f MB, %d entries (reading starts on search)",
+            self._cd_size / 1e6,
+            self._total_entries,
+        )
 
     def _ensure_directory(self, progress=None) -> None:
         """Read and parse the central directory once. progress(phase, done, total)."""
@@ -510,7 +529,10 @@ class ArchiveReader:
             # sequential read, then parse locally — the network stays busy
             # and is not slowed down by the parsing.
             tmp = tempfile.TemporaryFile()
+            logger.info("Downloading central directory (%.0f MB) to local disk…", remaining / 1e6)
             done = 0
+            next_log = 256 * 1024 * 1024
+            t0 = time.perf_counter()
             while remaining:
                 chunk = fh.read(min(8 * 1024 * 1024, remaining))
                 if not chunk:
@@ -519,8 +541,18 @@ class ArchiveReader:
                 remaining -= len(chunk)
                 done += len(chunk)
                 tmp.write(chunk)
+                if done >= next_log:
+                    next_log += 256 * 1024 * 1024
+                    rate = done / max(time.perf_counter() - t0, 1e-6) / 1e6
+                    logger.info("  read %d / %d MB (%.0f MB/s)", done / 1e6, self._cd_size / 1e6, rate)
                 if progress:
                     progress("read", done // (1024 * 1024), self._cd_size // (1024 * 1024))
+            logger.info(
+                "Central directory downloaded: %.0f MB in %.0f s (%.0f MB/s)",
+                done / 1e6,
+                time.perf_counter() - t0,
+                done / max(time.perf_counter() - t0, 1e-6) / 1e6,
+            )
             tmp.seek(0)
             source = tmp
             remaining = self._cd_size
@@ -536,6 +568,9 @@ class ArchiveReader:
         buf = bytearray()
         pos = 0
         parsed = 0
+        next_log = 1_000_000
+        t0 = time.perf_counter()
+        logger.info("Parsing central directory (%d entries)…", self._total_entries)
         while True:
             if len(buf) - pos < 46:
                 if remaining <= 0:
@@ -576,6 +611,9 @@ class ArchiveReader:
             if not _SWE_SUFFIX_RE.search(name_raw):
                 parsed += 1
                 pos += entry_len
+                if parsed >= next_log:
+                    next_log += 1_000_000
+                    logger.info("  parsed %d / %d entries (%.0f s)", parsed, self._total_entries, time.perf_counter() - t0)
                 if progress and parsed % 100000 == 0:
                     progress("parse", parsed, self._total_entries)
                 continue
@@ -597,6 +635,12 @@ class ArchiveReader:
             self._swe[name] = (offset, csize, usize, method, crc, flags)
         if parsed != self._total_entries:
             raise ArchiveError(f"{self.path.name}: incomplete zip central directory")
+        logger.info(
+            "Central directory parsed: %d entries in %.0f s, %d SWE files kept",
+            parsed,
+            time.perf_counter() - t0,
+            len(self._swe),
+        )
 
     @staticmethod
     def _zip64_extra(extra: bytes, csize: int, usize: int, offset: int) -> tuple[int, int, int]:
@@ -769,12 +813,17 @@ def build_archive_index(source: "str | Path | ArchiveReader", progress=None) -> 
         if reader._fh is not None:  # zip: load the parsed directory or cache it
             entries = _load_entry_cache(archive_path)
             if entries is not None:
+                logger.info("Index cache hit: %d entries from %s (no network reads)", len(entries), _archive_cache_file(archive_path))
                 reader._swe = {name: tuple(rec) for name, *rec in entries}
                 reader._ready = True
             else:
+                logger.info("No index cache for this archive, reading it")
                 reader._ensure_directory(progress)
                 entries = [[name, *rec] for name, rec in reader._swe.items()]
                 _save_entry_cache(archive_path, entries)
+                cache_file = _archive_cache_file(archive_path)
+                if cache_file is not None and cache_file.is_file():
+                    logger.info("Index cache saved: %s (%.1f MB)", cache_file, cache_file.stat().st_size / 1e6)
         candidates: dict[tuple[str, str, str], dict[str, int]] = defaultdict(dict)
         versions: dict[tuple[str, str], set[str]] = defaultdict(set)
         kind_counts: dict[str, int] = defaultdict(int)
@@ -853,17 +902,30 @@ def _extract_needed(
             mapped.append(dest)
         match.files = mapped
     if not todo:
+        logger.info("Extraction: no files to pull from the archive")
         return []
     errors: list[str] = []
     done = 0
+    logger.info("Extracting %d files from the archive…", len(todo))
     for dest, member in todo.items():
         try:
+            t0 = time.perf_counter()
             reader.extract(member, dest)
+            logger.info(
+                "  [%d/%d] %s (%.1f MB, %.1f s)",
+                done + 1,
+                len(todo),
+                dest.name,
+                dest.stat().st_size / 1e6,
+                time.perf_counter() - t0,
+            )
         except (ArchiveError, OSError) as exc:
             errors.append(f"{member}: {exc}")
+            logger.warning("  [%d/%d] FAILED %s: %s", done + 1, len(todo), member, exc)
         done += 1
         if progress:
             progress(done, len(todo), dest.name)
+    logger.info("Extraction done: %d ok, %d errors", len(todo) - len(errors), len(errors))
     return errors
 
 
